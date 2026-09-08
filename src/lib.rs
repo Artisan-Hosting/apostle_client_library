@@ -13,7 +13,10 @@ pub mod ledger;
 pub use bundle::{MailBundle, MailServerConfig};
 pub use email::Email;
 #[cfg(feature = "server-components")]
-pub use ledger::{Ledger, LedgerHandle, LedgerWorker, UsageEvent, UsageRecord};
+pub use ledger::{
+    BundleChunkOptions, IdentitySummary, Ledger, LedgerHandle, LedgerWorker, UsageEvent,
+    UsageRecord,
+};
 
 #[path = "../src/tests/email.rs"]
 mod email_test;

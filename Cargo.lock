@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "acai_core"
-version = "0.9.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37bc3fd755e2eee45ebf966bb0f3053d760329b497968e7a5b2ad6d01c71b539"
+checksum = "c0b33f28a8e8f0e1f1b7ff3865add68b549d436b57a5952baa1ab1467264081c"
 dependencies = [
  "argon2",
  "blake3",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "apostle_client"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "acai_core",
  "colored",

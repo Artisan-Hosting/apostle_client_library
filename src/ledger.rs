@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use dusa_collection_utils::core::errors::{ErrorArrayItem, Errors};
+use serde::Serialize;
 use sqlx::{
     Row,
     sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
@@ -25,7 +26,7 @@ pub struct UsageEvent {
 }
 
 /// One row from [`Ledger::report`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UsageRecord {
     pub recipient: String,
     pub subject: String,
@@ -33,7 +34,15 @@ pub struct UsageRecord {
     pub occurred_at: String,
 }
 
+/// One row from [`Ledger::list_identities`].
+#[derive(Debug, Clone, Serialize)]
+pub struct IdentitySummary {
+    pub identity: String,
+    pub created_at: String,
+}
+
 /// A small SQLite (WAL-mode) database tracking issued identities and their usage.
+#[derive(Clone)]
 pub struct Ledger {
     pool: SqlitePool,
 }
@@ -108,6 +117,51 @@ impl Ledger {
         .await
         .map_err(sqlx_err)?;
         Ok(secret)
+    }
+
+    /// Resolves an inbound `identity_secret` back to the identity it was issued to, if
+    /// any. Returns `Ok(None)` for a well-formed but unrecognized/unissued secret.
+    pub async fn identity_for_secret(
+        &self,
+        secret: [u8; 4],
+    ) -> Result<Option<String>, ErrorArrayItem> {
+        let row = sqlx::query("SELECT identity FROM identities WHERE secret = ?")
+            .bind(secret.as_slice())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(sqlx_err)?;
+
+        Ok(row.map(|row| row.get::<String, _>("identity")))
+    }
+
+    /// Lists every issued identity, alphabetically. Never includes the secret itself
+    /// — this is a directory listing, not a way to recover a lost bundle.
+    pub async fn list_identities(&self) -> Result<Vec<IdentitySummary>, ErrorArrayItem> {
+        let rows = sqlx::query("SELECT identity, created_at FROM identities ORDER BY identity")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sqlx_err)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| IdentitySummary {
+                identity: row.get::<String, _>("identity"),
+                created_at: row.get::<String, _>("created_at"),
+            })
+            .collect())
+    }
+
+    /// Removes an identity and its secret from the ledger, so any bundle carrying its
+    /// old secret is rejected from then on. Leaves that identity's `usage` history in
+    /// place (it's an append-only audit log, not owned by the identity row). Returns
+    /// whether an identity was actually found and removed.
+    pub async fn revoke_identity(&self, identity: &str) -> Result<bool, ErrorArrayItem> {
+        let result = sqlx::query("DELETE FROM identities WHERE identity = ?")
+            .bind(identity)
+            .execute(&self.pool)
+            .await
+            .map_err(sqlx_err)?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Records one usage event.
@@ -217,17 +271,27 @@ impl LedgerWorker {
     }
 }
 
-/// Writes `secret` into a fresh `.acai` bundle built from `source_dir` (which should
-/// hold `config.json` + `mail_server_pub.der`, the same base files the shared bundle
-/// uses), as an IMMUTABLE, SECRET-flagged, non-CRITICAL custom TLV. Rotation is just
-/// calling this again with a new secret — the bundle is always built fresh, never
-/// patched in place.
-pub fn issue_bundle(
-    source_dir: &Path,
+/// Tuning knobs for acai_core's chunk builder, passed straight through to the
+/// `chunk_padding`/`chunk_target_size` fields of its container-build request. `None`
+/// keeps acai_core's own default for that field (`chunk_padding: true`,
+/// `chunk_target_size` ~32MiB).
+///
+/// Note what this does *not* control: acai_core 0.9.0 reserves a fixed 50MiB chunk
+/// *index* region up front in every container regardless of content size or these
+/// options (`acai_core::chunk_index::INDEX_REGION_SIZE`, not exposed as a build
+/// parameter at all) — that's the dominant contributor to a small bundle like ours
+/// coming out ~50MB, and neither field here changes it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BundleChunkOptions {
+    pub chunk_padding: Option<bool>,
+    pub chunk_target_size: Option<u64>,
+}
+
+fn secret_tlv_request(
     secret: [u8; 4],
-    output_path: &Path,
-) -> Result<(), ErrorArrayItem> {
-    let request = serde_json::json!({
+    options: BundleChunkOptions,
+) -> Result<Vec<u8>, ErrorArrayItem> {
+    let mut request = serde_json::json!({
         "extra_tlvs": [{
             "ty": LEDGER_SECRET_TLV_TYPE,
             "immutable": true,
@@ -236,8 +300,43 @@ pub fn issue_bundle(
             "value": secret.to_vec(),
         }]
     });
-    let request_bytes = serde_json::to_vec(&request)?;
+    if let Some(padding) = options.chunk_padding {
+        request["chunk_padding"] = serde_json::json!(padding);
+    }
+    if let Some(target_size) = options.chunk_target_size {
+        request["chunk_target_size"] = serde_json::json!(target_size);
+    }
+    Ok(serde_json::to_vec(&request)?)
+}
+
+/// Writes `secret` into a fresh `.acai` bundle built from `source_dir` (which should
+/// hold `config.json` + `mail_server_pub.der`, the same base files the shared bundle
+/// uses), as an IMMUTABLE, SECRET-flagged, non-CRITICAL custom TLV. Rotation is just
+/// calling this again with a new secret — the bundle is always built fresh, never
+/// patched in place.
+pub fn issue_bundle(
+    source_dir: &Path,
+    secret: [u8; 4],
+    options: BundleChunkOptions,
+    output_path: &Path,
+) -> Result<(), ErrorArrayItem> {
+    let request_bytes = secret_tlv_request(secret, options)?;
     acai_core::build_container_file_from_directory(source_dir, &request_bytes, output_path)
+        .map_err(|err| ErrorArrayItem::new(Errors::ConfigReading, err.to_string()))
+}
+
+/// Same as [`issue_bundle`], but builds the container fully in memory and returns its
+/// bytes instead of writing them to disk. Prefer this whenever the caller doesn't
+/// specifically need a file on disk (e.g. handing the bundle back over a socket or
+/// network connection) — the personalized bundle carries a per-identity secret, so
+/// skipping a temp-file round trip means that secret never touches shared storage.
+pub fn issue_bundle_bytes(
+    source_dir: &Path,
+    secret: [u8; 4],
+    options: BundleChunkOptions,
+) -> Result<Vec<u8>, ErrorArrayItem> {
+    let request_bytes = secret_tlv_request(secret, options)?;
+    acai_core::build_container_from_directory(source_dir, &request_bytes)
         .map_err(|err| ErrorArrayItem::new(Errors::ConfigReading, err.to_string()))
 }
 
@@ -290,6 +389,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_for_secret_round_trips_and_rejects_unknown() {
+        let (ledger, _dir) = open_temp_ledger().await;
+
+        let secret = ledger.issue_identity("dwhitfield@artisanhosting.net").await.unwrap();
+        let resolved = ledger.identity_for_secret(secret).await.unwrap();
+        assert_eq!(resolved.as_deref(), Some("dwhitfield@artisanhosting.net"));
+
+        let unissued = ledger.identity_for_secret([9, 9, 9, 9]).await.unwrap();
+        assert_eq!(unissued, None);
+    }
+
+    #[tokio::test]
+    async fn list_identities_lists_alphabetically() {
+        let (ledger, _dir) = open_temp_ledger().await;
+
+        ledger.issue_identity("zed@example.com").await.unwrap();
+        ledger.issue_identity("anna@example.com").await.unwrap();
+
+        let identities = ledger.list_identities().await.unwrap();
+        let names: Vec<&str> = identities.iter().map(|i| i.identity.as_str()).collect();
+        assert_eq!(names, vec!["anna@example.com", "zed@example.com"]);
+        assert!(identities.iter().all(|i| !i.created_at.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn revoke_identity_removes_it_and_invalidates_its_secret() {
+        let (ledger, _dir) = open_temp_ledger().await;
+
+        let secret = ledger.issue_identity("someone@example.com").await.unwrap();
+        assert!(ledger.revoke_identity("someone@example.com").await.unwrap());
+
+        assert_eq!(ledger.identity_for_secret(secret).await.unwrap(), None);
+        assert!(
+            !ledger
+                .list_identities()
+                .await
+                .unwrap()
+                .iter()
+                .any(|i| i.identity == "someone@example.com")
+        );
+
+        // Revoking again (or an identity that never existed) reports "nothing found"
+        // rather than erroring.
+        assert!(!ledger.revoke_identity("someone@example.com").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn issuing_twice_rotates_the_secret() {
         let (ledger, _dir) = open_temp_ledger().await;
         let first = ledger.issue_identity("someone@example.com").await.unwrap();
@@ -329,9 +475,7 @@ mod tests {
         assert!(report.iter().all(|r| r.success));
     }
 
-    #[tokio::test]
-    async fn issue_bundle_writes_a_readable_identity_secret() {
-        let temp = tempfile::tempdir().unwrap();
+    fn write_bundle_source(temp: &tempfile::TempDir) -> std::path::PathBuf {
         let source_dir = temp.path().join("source");
         std::fs::create_dir_all(&source_dir).unwrap();
         std::fs::File::create(source_dir.join("config.json"))
@@ -346,12 +490,64 @@ mod tests {
                 132, 147, 103, 80, 141, 7, 41, 46, 32, 80, 190, 84,
             ])
             .unwrap();
+        source_dir
+    }
+
+    #[tokio::test]
+    async fn issue_bundle_writes_a_readable_identity_secret() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = write_bundle_source(&temp);
 
         let secret = [1, 2, 3, 4];
         let output_path = temp.path().join("bundle.acai");
-        issue_bundle(&source_dir, secret, &output_path).unwrap();
+        issue_bundle(&source_dir, secret, BundleChunkOptions::default(), &output_path).unwrap();
 
         let bundle = crate::bundle::MailBundle::load(&output_path).unwrap();
         assert_eq!(bundle.identity_secret, Some(secret));
+    }
+
+    #[tokio::test]
+    async fn issue_bundle_bytes_matches_the_file_based_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = write_bundle_source(&temp);
+
+        let secret = [5, 6, 7, 8];
+        let bytes = issue_bundle_bytes(&source_dir, secret, BundleChunkOptions::default()).unwrap();
+
+        // MailBundle::load only reads from a path, so round-trip the in-memory bytes
+        // through a temp file purely to reuse it for verification here.
+        let readback_path = temp.path().join("bytes.acai");
+        std::fs::write(&readback_path, &bytes).unwrap();
+        let bundle = crate::bundle::MailBundle::load(&readback_path).unwrap();
+        assert_eq!(bundle.identity_secret, Some(secret));
+    }
+
+    /// Documents (rather than just asserting in a doc comment) that
+    /// `chunk_padding`/`chunk_target_size` do NOT shrink a tiny bundle like ours below
+    /// ~50MB: the dominant cost is `acai_core::chunk_index::INDEX_REGION_SIZE`, a fixed
+    /// 50MiB region reserved up front regardless of these options. If this test starts
+    /// failing because a bundle got small, that's acai_core changing its indexing
+    /// scheme -- worth knowing, not a regression to "fix" by tightening the assertion.
+    #[tokio::test]
+    async fn chunk_options_do_not_shrink_the_fixed_index_region() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = write_bundle_source(&temp);
+
+        let secret = [9, 9, 9, 9];
+        let bytes = issue_bundle_bytes(
+            &source_dir,
+            secret,
+            BundleChunkOptions {
+                chunk_padding: Some(false),
+                chunk_target_size: Some(1),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            bytes.len() > 50_000_000,
+            "expected the fixed index region to still dominate bundle size, got {} bytes",
+            bytes.len()
+        );
     }
 }
