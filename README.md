@@ -144,6 +144,37 @@ worker_task.await?;
 # }
 ```
 
+### Per-identity hourly limits
+
+Each identity can carry an optional hourly sending limit, stored alongside it
+in the same `identities` row:
+
+```rust
+# use apostle_client::Ledger;
+# async fn example(ledger: &Ledger, secret: [u8; 4]) -> Result<(), Box<dyn std::error::Error>> {
+// Cap this identity at 100 sends/hour. `None` clears the limit (unlimited).
+ledger.set_hourly_limit("dwhitfield@artisanhosting.net", Some(100)).await?;
+
+// Resolving a secret and its limit together costs one query, not two — useful
+// on the hot path that admits or throttles an inbound send.
+if let Some((identity, hourly_limit)) = ledger.identity_with_limit_for_secret(secret).await? {
+    println!("{identity} is limited to {hourly_limit:?} sends/hour");
+}
+# Ok(())
+# }
+```
+
+`Ledger::list_identities` also returns each identity's current limit via
+`IdentitySummary::hourly_limit`. Existing databases created before this field
+was added are migrated in place the next time `Ledger::open` runs (an `ALTER
+TABLE ... ADD COLUMN`, applied once and skipped thereafter).
+
+**What this stores, not enforces:** the ledger only records and reports the
+limit — actually counting an identity's sends in the trailing hour and
+rejecting or queuing over-limit ones is caller-side work, same as secret
+verification above. `Ledger::report`'s `occurred_at` timestamps are what a
+caller would query to compute that count.
+
 A bundle built via `issue_bundle` carries its secret as an IMMUTABLE, SECRET-
 flagged custom TLV (`acai_core`'s `0x8000-0xFFFF` "private" range) —
 `MailBundle::load` surfaces it as `identity_secret: Option<[u8; 4]>` (`None`

@@ -39,6 +39,7 @@ pub struct UsageRecord {
 pub struct IdentitySummary {
     pub identity: String,
     pub created_at: String,
+    pub hourly_limit: Option<u32>,
 }
 
 /// A small SQLite (WAL-mode) database tracking issued identities and their usage.
@@ -70,12 +71,28 @@ impl Ledger {
             "CREATE TABLE IF NOT EXISTS identities (
                 identity TEXT PRIMARY KEY,
                 secret BLOB NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                hourly_limit INTEGER
             )",
         )
         .execute(&pool)
         .await
         .map_err(sqlx_err)?;
+
+        // `CREATE TABLE IF NOT EXISTS` above doesn't touch a table that already existed
+        // before `hourly_limit` was added, so migrate it in separately. Idempotent: a
+        // second run (or a DB created fresh with the column already in the `CREATE
+        // TABLE` above) hits "duplicate column name", which we swallow; any other
+        // failure is real and propagates.
+        if let Err(err) = sqlx::query("ALTER TABLE identities ADD COLUMN hourly_limit INTEGER")
+            .execute(&pool)
+            .await
+        {
+            let message = err.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(sqlx_err(err));
+            }
+        }
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS usage (
@@ -134,21 +151,65 @@ impl Ledger {
         Ok(row.map(|row| row.get::<String, _>("identity")))
     }
 
+    /// Like [`identity_for_secret`](Self::identity_for_secret), but also returns the
+    /// identity's current per-identity hourly limit (if any) in the same query, so
+    /// callers that need both don't pay for a second round trip.
+    pub async fn identity_with_limit_for_secret(
+        &self,
+        secret: [u8; 4],
+    ) -> Result<Option<(String, Option<u32>)>, ErrorArrayItem> {
+        let row = sqlx::query("SELECT identity, hourly_limit FROM identities WHERE secret = ?")
+            .bind(secret.as_slice())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(sqlx_err)?;
+
+        Ok(row.map(|row| {
+            let identity = row.get::<String, _>("identity");
+            let hourly_limit = row
+                .get::<Option<i64>, _>("hourly_limit")
+                .map(|value| value as u32);
+            (identity, hourly_limit)
+        }))
+    }
+
     /// Lists every issued identity, alphabetically. Never includes the secret itself
     /// — this is a directory listing, not a way to recover a lost bundle.
     pub async fn list_identities(&self) -> Result<Vec<IdentitySummary>, ErrorArrayItem> {
-        let rows = sqlx::query("SELECT identity, created_at FROM identities ORDER BY identity")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(sqlx_err)?;
+        let rows = sqlx::query(
+            "SELECT identity, created_at, hourly_limit FROM identities ORDER BY identity",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sqlx_err)?;
 
         Ok(rows
             .into_iter()
             .map(|row| IdentitySummary {
                 identity: row.get::<String, _>("identity"),
                 created_at: row.get::<String, _>("created_at"),
+                hourly_limit: row
+                    .get::<Option<i64>, _>("hourly_limit")
+                    .map(|value| value as u32),
             })
             .collect())
+    }
+
+    /// Sets (or clears, with `limit: None`) the per-identity hourly sending limit used
+    /// by callers to throttle admissions before queueing. Returns whether `identity`
+    /// was found (and thus updated).
+    pub async fn set_hourly_limit(
+        &self,
+        identity: &str,
+        limit: Option<u32>,
+    ) -> Result<bool, ErrorArrayItem> {
+        let result = sqlx::query("UPDATE identities SET hourly_limit = ? WHERE identity = ?")
+            .bind(limit.map(|value| value as i64))
+            .bind(identity)
+            .execute(&self.pool)
+            .await
+            .map_err(sqlx_err)?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Removes an identity and its secret from the ledger, so any bundle carrying its
@@ -411,6 +472,106 @@ mod tests {
         let names: Vec<&str> = identities.iter().map(|i| i.identity.as_str()).collect();
         assert_eq!(names, vec!["anna@example.com", "zed@example.com"]);
         assert!(identities.iter().all(|i| !i.created_at.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn hourly_limit_can_be_set_cleared_and_is_returned_with_the_secret_lookup() {
+        let (ledger, _dir) = open_temp_ledger().await;
+        let secret = ledger.issue_identity("limited@example.com").await.unwrap();
+
+        // No limit set yet.
+        let (identity, limit) = ledger
+            .identity_with_limit_for_secret(secret)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity, "limited@example.com");
+        assert_eq!(limit, None);
+
+        assert!(ledger
+            .set_hourly_limit("limited@example.com", Some(42))
+            .await
+            .unwrap());
+
+        let (_, limit) = ledger
+            .identity_with_limit_for_secret(secret)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(limit, Some(42));
+
+        let identities = ledger.list_identities().await.unwrap();
+        assert_eq!(
+            identities
+                .iter()
+                .find(|i| i.identity == "limited@example.com")
+                .and_then(|i| i.hourly_limit),
+            Some(42)
+        );
+
+        // Clearing goes back to unlimited.
+        assert!(ledger
+            .set_hourly_limit("limited@example.com", None)
+            .await
+            .unwrap());
+        let (_, limit) = ledger
+            .identity_with_limit_for_secret(secret)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(limit, None);
+
+        // Setting a limit on an identity that doesn't exist reports "not found".
+        assert!(!ledger
+            .set_hourly_limit("nobody@example.com", Some(1))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn open_migrates_a_pre_existing_db_missing_the_hourly_limit_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ledger.sqlite3");
+
+        // Simulate a DB created before `hourly_limit` existed: same schema, minus that
+        // column.
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            let pool = SqlitePoolOptions::new().connect_with(options).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE identities (
+                    identity TEXT PRIMARY KEY,
+                    secret BLOB NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO identities (identity, secret) VALUES ('old@example.com', X'01020304')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+
+        // Re-opening through `Ledger::open` should migrate the column in without error
+        // and leave the pre-existing row intact (with no limit set).
+        let ledger = Ledger::open(&db_path).await.unwrap();
+        let identities = ledger.list_identities().await.unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].identity, "old@example.com");
+        assert_eq!(identities[0].hourly_limit, None);
+
+        assert!(ledger
+            .set_hourly_limit("old@example.com", Some(7))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
