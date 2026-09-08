@@ -212,6 +212,26 @@ impl Ledger {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Looks up a single identity by name (never its secret), returning its creation
+    /// time and current hourly limit if it exists.
+    pub async fn get_identity(&self, identity: &str) -> Result<Option<IdentitySummary>, ErrorArrayItem> {
+        let row = sqlx::query(
+            "SELECT identity, created_at, hourly_limit FROM identities WHERE identity = ?",
+        )
+        .bind(identity)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(sqlx_err)?;
+
+        Ok(row.map(|row| IdentitySummary {
+            identity: row.get::<String, _>("identity"),
+            created_at: row.get::<String, _>("created_at"),
+            hourly_limit: row
+                .get::<Option<i64>, _>("hourly_limit")
+                .map(|value| value as u32),
+        }))
+    }
+
     /// Removes an identity and its secret from the ledger, so any bundle carrying its
     /// old secret is rejected from then on. Leaves that identity's `usage` history in
     /// place (it's an append-only audit log, not owned by the identity row). Returns
@@ -572,6 +592,22 @@ mod tests {
             .set_hourly_limit("old@example.com", Some(7))
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_identity_returns_a_single_identity_or_none() {
+        let (ledger, _dir) = open_temp_ledger().await;
+        ledger.issue_identity("someone@example.com").await.unwrap();
+        ledger
+            .set_hourly_limit("someone@example.com", Some(10))
+            .await
+            .unwrap();
+
+        let found = ledger.get_identity("someone@example.com").await.unwrap();
+        assert_eq!(found.as_ref().map(|i| i.hourly_limit), Some(Some(10)));
+
+        let missing = ledger.get_identity("nobody@example.com").await.unwrap();
+        assert!(missing.is_none());
     }
 
     #[tokio::test]
