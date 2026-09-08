@@ -78,7 +78,7 @@ impl MailServerConfig {
 /// `.acai` bundle produced by `acai_core`. `identity_secret` is present only for a
 /// bundle personalized for a specific user via [`crate::ledger::issue_bundle`] — a
 /// shared/base bundle has no such TLV and loads with `identity_secret: None`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailBundle {
     pub server_config: MailServerConfig,
     pub server_pub_key: [u8; 32],
