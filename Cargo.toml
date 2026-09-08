@@ -1,10 +1,9 @@
 [package]
 name = "apostle_client"
-version = "0.1.0"
-edition = "2021"
+version = "1.0.0"
+edition = "2024"
 authors = [
-    "Artisan Hosting",
-    "Darrion Whitfield <dwhitfield@ramfield.net>"
+    "Darrion Whitfield <whitfieldd@artisanhosting.net>"
 ]
 description = "Standalone client for sending mail through the Artisan mail protocol"
 homepage = "https://docs.artisanhosting.net"
