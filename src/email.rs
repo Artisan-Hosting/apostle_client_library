@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use colored::Colorize;
 use dusa_collection_utils::{
     core::errors::{ErrorArrayItem, Errors},
@@ -228,6 +229,50 @@ impl Email {
         let email_data: String = serde_json::to_string(&request).map_err(ErrorArrayItem::from)?;
 
         let _: () = send_message(&mut stream, email_data, Proto::TCP, &mut conn).await?;
+
+        Ok(())
+    }
+
+    pub fn validate_destination(destination: &str) -> Result<(), ErrorArrayItem> {
+        let trimmed = destination.trim();
+        if trimmed.is_empty() {
+            return Err(ErrorArrayItem::new(
+                Errors::GeneralError,
+                "email destination cannot be empty",
+            ));
+        }
+
+        if trimmed.len() > 254 {
+            return Err(ErrorArrayItem::new(
+                Errors::GeneralError,
+                "email destination is too long",
+            ));
+        }
+
+        if trimmed.contains(' ') {
+            return Err(ErrorArrayItem::new(
+                Errors::GeneralError,
+                "email destination contains whitespace",
+            ));
+        }
+
+        let mut parts = trimmed.split('@');
+        let local = parts.next().unwrap_or("");
+        let domain = parts.next().unwrap_or("");
+
+        if local.is_empty() || domain.is_empty() || parts.next().is_some() {
+            return Err(ErrorArrayItem::new(
+                Errors::GeneralError,
+                "email destination is not a valid address",
+            ));
+        }
+
+        if !domain.contains('.') {
+            return Err(ErrorArrayItem::new(
+                Errors::GeneralError,
+                "email destination domain must contain a dot",
+            ));
+        }
 
         Ok(())
     }
